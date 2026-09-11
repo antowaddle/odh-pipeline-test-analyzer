@@ -12,6 +12,7 @@ if env_file.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
+                value = value.strip().strip('"').strip("'")
                 os.environ[key] = value
 
 
@@ -20,13 +21,13 @@ class Config:
 
     # SSL Verification - set to "false" for internal CAs or self-signed certs
     # Default: True (secure)
-    SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() == "true"
+    SSL_VERIFY = os.getenv("SSL_VERIFY", "false").lower() == "true"
 
     # Jenkins Configuration
     JENKINS_URL = os.getenv("JENKINS_URL")
-    JENKINS_TOKEN = os.getenv("JENKINS_TOKEN", "")
+    JENKINS_TOKEN = os.getenv("JENKINS_TOKEN", "") or os.getenv("JENKINS_API_TOKEN", "")
     JENKINS_USERNAME = os.getenv("JENKINS_USER", "")
-    JENKINS_PASSWORD = os.getenv("JENKINS_TOKEN", "")  # Token is used as password
+    JENKINS_PASSWORD = os.getenv("JENKINS_TOKEN", "") or os.getenv("JENKINS_API_TOKEN", "")
     
     # Jenkins MCP Server (if available)
     JENKINS_MCP_URL = os.getenv("JENKINS_MCP_URL", "")  # e.g., https://jenkins.com/mcp/sse
