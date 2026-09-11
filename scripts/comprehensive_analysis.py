@@ -33,6 +33,7 @@ if env_file.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
+                value = value.strip().strip('"').strip("'")
                 os.environ[key] = value
 
 from analyzer import jenkins_client, artifact_parser, failure_analyzer, jira_client, cluster_inspector
@@ -2597,9 +2598,9 @@ async def main():
     # Create jenkins client for build lookup
     jenkins_cli = jenkins_client.JenkinsClient(
         jenkins_url=os.getenv("JENKINS_URL", "https://your-jenkins-url.example.com"),
-        jenkins_token=os.getenv("JENKINS_TOKEN", ""),
+        jenkins_token=os.getenv("JENKINS_TOKEN", "") or os.getenv("JENKINS_API_TOKEN", ""),
         jenkins_username=os.getenv("JENKINS_USER", ""),
-        jenkins_password=os.getenv("JENKINS_TOKEN", "")
+        jenkins_password=os.getenv("JENKINS_TOKEN", "") or os.getenv("JENKINS_API_TOKEN", "")
     )
     
     build_time = None
