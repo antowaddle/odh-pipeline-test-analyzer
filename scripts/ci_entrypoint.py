@@ -80,9 +80,23 @@ def configure_mcp_servers():
 
     config = {"projects": {"/app": {"hasTrustDialogAccepted": True}}, "mcpServers": {}}
 
-    # Slack MCP — disabled in CI. Session tokens (xoxc/xoxd) expire frequently
-    # and can't be refreshed programmatically. Slack posting is handled by the
-    # interactive Claude Code agent when running locally.
+    # Slack MCP — configured when SLACK_XOXC_TOKEN and SLACK_XOXD_TOKEN are set.
+    # Session tokens (xoxc/xoxd) expire every 2-4 weeks; refresh in Vault when needed.
+    xoxc = os.getenv("SLACK_XOXC_TOKEN", "")
+    xoxd = os.getenv("SLACK_XOXD_TOKEN", "")
+    if xoxc and xoxd:
+        config["mcpServers"]["slack"] = {
+            "command": sys.executable,
+            "args": ["/opt/slack-mcp/slack_mcp_server.py"],
+            "env": {
+                "SLACK_XOXC_TOKEN": xoxc,
+                "SLACK_XOXD_TOKEN": xoxd,
+                "MCP_TRANSPORT": "stdio",
+            },
+        }
+        log("MCP: Slack server configured")
+    else:
+        log("MCP: Slack server skipped (no xoxc/xoxd tokens)")
 
     # Kubernetes MCP — needs KUBECONFIG or ~/.kube/config
     kubeconfig = os.getenv("KUBECONFIG", str(home / ".kube" / "config"))
@@ -257,6 +271,64 @@ def setup_cluster_access(product: str, build_number: str) -> bool:
         return False
 
 
+def check_dsc_status() -> dict | None:
+    """Check DataScienceCluster status. Returns dict with health info or None if unavailable."""
+    try:
+        result = subprocess.run(
+            ["oc", "get", "datasciencecluster", "-A", "-o", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log("DSC check: could not retrieve DataScienceCluster")
+            return None
+
+        data = json.loads(result.stdout)
+        items = data.get("items", [])
+        if not items:
+            log("DSC check: no DataScienceCluster found")
+            return {"healthy": False, "error": "No DataScienceCluster resource exists", "components": {}}
+
+        dsc = items[0]
+        phase = dsc.get("status", {}).get("phase", "Unknown")
+        conditions = {c["type"]: c for c in dsc.get("status", {}).get("conditions", [])}
+
+        # Component readiness from conditions (e.g. DashboardReady, KserveReady)
+        # Conditions ending in "Ready" with status != "True" and reason != "Removed" are failing
+        components = {}
+        failing = []
+        for ctype, c in conditions.items():
+            if ctype.endswith("Ready") and ctype != "Ready":
+                comp_name = ctype.replace("Ready", "")
+                is_removed = c.get("reason", "") == "Removed"
+                is_ready = c.get("status") == "True" or is_removed
+                components[comp_name] = {"ready": is_ready, "removed": is_removed, "reason": c.get("reason", ""), "message": c.get("message", "")}
+                if not is_ready:
+                    failing.append(comp_name)
+
+        healthy = phase == "Ready" and not failing
+
+        status = {
+            "healthy": healthy,
+            "phase": phase,
+            "conditions": {t: {"status": c.get("status"), "reason": c.get("reason", ""), "message": c.get("message", "")} for t, c in conditions.items()},
+            "components": components,
+            "failing_components": failing,
+        }
+
+        managed_count = sum(1 for c in components.values() if not c["removed"])
+        if healthy:
+            log(f"DSC check: healthy (phase={phase}, {managed_count} managed components)")
+        else:
+            fail_details = ", ".join(f"{c} ({components[c]['reason']}: {components[c]['message'][:80]})" for c in failing)
+            log(f"DSC check: UNHEALTHY (phase={phase}) — {fail_details}")
+
+        return status
+
+    except Exception as e:
+        log(f"DSC check: error — {e}")
+        return None
+
+
 def setup_frontend_repo():
     """Clone odh-dashboard if FRONTEND_REPO_PATH is not set."""
     frontend_path = os.getenv("FRONTEND_REPO_PATH")
@@ -290,7 +362,7 @@ def setup_frontend_repo():
     return str(clone_dir)
 
 
-def run_analysis(build_number: str, product: str) -> int:
+def run_analysis(build_number: str, product: str, skip_slack: bool = True) -> int:
     """Run comprehensive_analysis.py and return the exit code."""
     cmd = [
         sys.executable,
@@ -303,7 +375,7 @@ def run_analysis(build_number: str, product: str) -> int:
 
     if is_true("SKIP_RERUN"):
         cmd.append("--skip-rerun")
-    if not is_false("SKIP_SLACK"):
+    if skip_slack:
         cmd.append("--skip-slack")
     if is_true("SKIP_JIRA"):
         cmd.append("--skip-jira")
@@ -313,29 +385,95 @@ def run_analysis(build_number: str, product: str) -> int:
     return result.returncode
 
 
+def load_team_ownership() -> dict | None:
+    """Load team-ownership.json from odh-dashboard repo."""
+    candidates = []
+    frontend = os.getenv("FRONTEND_REPO_PATH", "")
+    if frontend:
+        candidates.append(
+            Path(frontend) / "packages/cypress/cypress/tests/e2e/team-ownership.json"
+        )
+    candidates.extend([
+        PROJECT_ROOT.parent / "odh-dashboard/packages/cypress/cypress/tests/e2e/team-ownership.json",
+        Path("/workspace/odh-dashboard/packages/cypress/cypress/tests/e2e/team-ownership.json"),
+    ])
+    for p in candidates:
+        if p.exists():
+            return json.loads(p.read_text())
+    return None
+
+
+def resolve_team_mention(file_path: str, ownership: dict | None) -> str:
+    """Map a test file path to a Slack team @-mention string."""
+    if not ownership:
+        return ""
+    match = re.search(r"e2e/(.+/)", file_path)
+    default_name = ownership.get("default_team", "")
+    teams = ownership.get("teams", [])
+
+    target_team = None
+    if match:
+        subpath = match.group(1)
+        for team in teams:
+            for pattern in team.get("path_patterns", []):
+                if subpath.startswith(pattern):
+                    target_team = team
+                    break
+            if target_team:
+                break
+
+    if not target_team and default_name:
+        for t in teams:
+            if t["name"] == default_name:
+                target_team = t
+                break
+
+    if not target_team:
+        return ""
+    gid = target_team.get("slack_group_id", "")
+    handle = target_team.get("slack_handle", "")
+    if gid and handle:
+        return f"<!subteam^{gid}|{handle}>"
+    return handle or ""
+
+
 def extract_phase1_context(build_number: str, product: str) -> dict:
     """Extract key findings from Phase 1 MD report for the agent prompt."""
     name = product.upper()
     md_path = PROJECT_ROOT / "reports" / "current" / name / f"latest-build-{build_number}.md"
 
-    context = {"failures": [], "flaky": [], "jira_ticket": ""}
+    context = {"failures": [], "flaky": [], "jira_ticket": "", "team_mentions": {}, "pipeline_failure": ""}
 
     if not md_path.exists():
         return context
 
     content = md_path.read_text()
+    ownership = load_team_ownership()
 
-    # Extract test failures from section headers: ### N. testName.cy.ts [⚠️ *(passed on retry)*]
     test_pattern = re.compile(
         r"^### \d+\.\s+(\S+\.cy\.ts)\s*(⚠️\s*\*\(passed on retry\)\*)?",
         re.MULTILINE,
     )
+    file_pattern = re.compile(r"\*\*📁 File:\*\*\s*`([^`]+)`")
+
     for m in test_pattern.finditer(content):
         test_name = m.group(1).replace(".cy.ts", "")
-        if m.group(2):
+        is_flaky = bool(m.group(2))
+        if is_flaky:
             context["flaky"].append(test_name)
         else:
             context["failures"].append(test_name)
+            chunk = content[m.end():m.end() + 500]
+            fm = file_pattern.search(chunk)
+            file_path = fm.group(1) if fm else ""
+            mention = resolve_team_mention(file_path, ownership)
+            if mention:
+                context["team_mentions"][test_name] = mention
+
+    # Extract pipeline failure step from MD report
+    step_match = re.search(r"\*\*Failed Step:\*\*\s*`([^`]+)`", content)
+    if step_match:
+        context["pipeline_failure"] = step_match.group(1)
 
     # Extract Jira lock ticket from file (written by comprehensive_analysis.py)
     ticket_file = Path("/app/jira-ticket.txt")
@@ -385,62 +523,172 @@ def find_previous_build_ticket(build_number: str, product: str) -> str:
     return ""
 
 
-def build_deep_analysis_prompt(build_number: str, product: str) -> str:
-    """Build a context-rich prompt with Phase 1 findings. Investigation steps are in CLAUDE.md."""
+DEEP_ANALYSIS_OUTPUT = Path("/tmp/deep_analysis.md")
+
+
+def build_deep_analysis_prompt(build_number: str, product: str, skip_slack: bool = False, dsc_status: dict | None = None) -> str:
+    """Build a prescriptive prompt with exact commands for each step."""
     name = product.upper()
     context = extract_phase1_context(build_number, product)
-
-    parts = [
-        f"Run deep analysis for build {build_number} {name}.",
-        f"Phase 1 reports: reports/current/{name}/latest-build-{build_number}.md and "
-        f"reports/current/{name}/latest-build-{build_number}.html.",
-    ]
-
-    if context["failures"]:
-        parts.append(
-            f"Real failures to investigate: {', '.join(context['failures'])}."
-        )
-
-    if context["flaky"]:
-        parts.append(
-            f"Flaky tests (passed on retry, lower priority): {', '.join(context['flaky'])}."
-        )
-
+    jira_ticket = context.get("jira_ticket", "")
     cluster_url = os.getenv("CLUSTER_API_URL", "").strip()
-    if cluster_url:
-        parts.append(
-            f"Cluster access is configured ({cluster_url}). "
-            f"Use K8s MCP tools to verify pod health, check operator logs, "
-            f"inspect ServingRuntime CRs, and confirm root causes with cluster evidence."
-        )
-
     prev_ticket = find_previous_build_ticket(build_number, product)
-    if prev_ticket:
-        parts.append(
-            f"Previous build analysis: {prev_ticket}. "
-            f"Read its comments for trend comparison."
+
+    md_report = f"reports/current/{name}/latest-build-{build_number}.md"
+    html_report = f"reports/current/{name}/latest-build-{build_number}.html"
+    screenshots_dir = f"reports/current/{name}/screenshots"
+    videos_dir = f"reports/current/{name}/videos"
+
+    failures_list = ", ".join(context["failures"]) if context["failures"] else "none"
+    flaky_count = len(context["flaky"])
+    pipeline_failure = context.get("pipeline_failure", "")
+
+    team_mentions = context.get("team_mentions", {})
+    team_lines = ""
+    if team_mentions:
+        team_lines = "\n- Team ownership (include these @-mentions next to each real failure in the Slack message):"
+        for test, mention in team_mentions.items():
+            team_lines += f"\n    {test} → {mention}"
+
+    jenkins_url = os.getenv("JENKINS_URL", "").strip().rstrip("/")
+    report_artifact_url = ""
+    if jenkins_url:
+        report_artifact_url = (
+            f"{jenkins_url}/job/components/job/dashboard"
+            f"/job/dashboard-e2e-tests/{build_number}/TFA_20Analysis/"
         )
 
-    if context["jira_ticket"]:
-        parts.append(
-            f"This build's lock ticket: {context['jira_ticket']}."
+    # DSC status context
+    dsc_lines = ""
+    dsc_unhealthy = False
+    if dsc_status is None:
+        dsc_lines = "\n- DSC status: unavailable (no cluster access)"
+    elif dsc_status.get("healthy"):
+        components = dsc_status.get("components", {})
+        managed_count = sum(1 for c in components.values() if not c.get("removed"))
+        dsc_lines = f"\n- DSC status: healthy (phase={dsc_status.get('phase')}, {managed_count} managed components ready)"
+    else:
+        dsc_unhealthy = True
+        failing = dsc_status.get("failing_components", [])
+        components = dsc_status.get("components", {})
+        comp_lines = []
+        for c, info in components.items():
+            if info.get("removed"):
+                continue
+            status = "ready" if info.get("ready") else f"NOT READY ({info.get('reason', '')}: {info.get('message', '')[:100]})"
+            comp_lines.append(f"{c}={status}")
+        dsc_lines = f"\n- DSC status: UNHEALTHY (phase={dsc_status.get('phase')}) — failing: {', '.join(failing)}"
+        dsc_lines += f"\n    Components: {', '.join(comp_lines)}"
+
+    dsc_alert_block = ""
+    if dsc_unhealthy:
+        dsc_alert_block = (
+            "\nDSC ALERT -- The DataScienceCluster is UNHEALTHY. This likely explains test failures."
+            "\nIn both the Slack message AND the deep analysis report, add a prominent banner at the TOP (before any test analysis):"
+            "\n- Use :rotating_light: emoji and *bold* to make it unmissable"
+            "\n- List which components are NOT READY and any condition errors"
+            "\n- Explain that tests depending on these components are expected to fail"
+            "\n- Check operator logs (oc logs deployment/rhods-operator -n redhat-ods-operator --tail=100) for root cause"
+            "\n- Link to any Jira tickets about the operator/DSC issue\n"
         )
 
-    parts.append(
-        "Execute steps 4b, 4c, 4d, and 5 from the Agent Workflow in CLAUDE.md. "
-        "Use scripts/inject_deep_analysis.py to update the reports. "
-        "Do NOT ask for confirmation — run everything autonomously."
-    )
+    prompt = f"""Nightly analysis for build {build_number} ({name}). Run every step below in order. Do NOT ask for confirmation. Do NOT skip any step.
 
-    if is_true("SKIP_JIRA"):
-        parts.append("Skip Jira posting.")
+CONTEXT:
+- MD report: {md_report}
+- HTML report: {html_report}
+- Screenshots: {screenshots_dir}/
+- Videos: {videos_dir}/
+- Real failures: {failures_list}
+- Flaky tests (passed on retry): {flaky_count}
+- Pipeline failure step: {pipeline_failure or 'none (pipeline succeeded)'}
+- Lock ticket: {jira_ticket or 'none'}
+- Previous build ticket: {prev_ticket or 'none'}
+- Cluster: {cluster_url or 'not configured'}{dsc_lines}{team_lines}
+- TFA report link: {report_artifact_url or 'not available'}
+{dsc_alert_block}
+STEP 1 — INVESTIGATE EACH REAL FAILURE
+For each real failure listed above, do ALL of the following (skip nothing):
+1a. Read the MD report section for this test — note error message and failure category.
+1b. Look at screenshots in {screenshots_dir}/ for this test — describe what the UI shows.
+1c. Check {videos_dir}/ for a recording — describe the failure sequence if present.
+1d. Grep the Jenkins console log for the test name — find the exact error and stack trace.
+1e. Use K8s MCP tools to check pod health in redhat-ods-applications and redhat-ods-operator.
+1f. Check operator age/version — use tracer output or `oc get csv` in redhat-ods-operator.
+1g. Search Jira: read {prev_ticket or 'the previous build ticket'} comments for this same failure.
+1h. Search RHOAIENG for open bugs mentioning this test name or error. Note key, status, assignee.
+1i. Search odh-dashboard repo for recent PRs touching the test file or related components. Use `gh pr list` and `gh api repos/opendatahub-io/odh-dashboard/commits`.
+1j. Read the test source in the odh-dashboard repo: frontend/src/__tests__/cypress/cypress/tests/e2e/
 
-    return " ".join(parts)
+STEP 2 — WRITE DEEP ANALYSIS
+Write findings to {DEEP_ANALYSIS_OUTPUT} under a `## Deep Analysis` heading.
+For each failure cluster, include: root cause, evidence, related PRs (with status), related Jira tickets (with status), trend vs previous builds, recommended action.
+
+STEP 3 — INJECT INTO REPORTS AND UPLOAD TO JIRA
+Run this exact command:
+python scripts/inject_deep_analysis.py {html_report} {DEEP_ANALYSIS_OUTPUT} --update-md {md_report}{f' --jira-ticket {jira_ticket}' if jira_ticket else ''}
+Verify: read the last 20 lines of {md_report} to confirm the deep analysis section was appended.
+
+STEP 4 — POST ANALYSIS SUMMARY TO JIRA
+Read the MD report to extract test counts (total, passed, failed, flaky).
+Run scripts/post_analysis_summaries.py jira with the correct values:
+python scripts/post_analysis_summaries.py jira --ticket {jira_ticket} --build {build_number} --platform {name} --total <N> --passed <N> --failed <N> --real-failures '<name:error:jira_key,...>' --flaky '<name1,name2>' --extra-notes '<key observation>'
+"""
+
+    slack_analysis_path = f"reports/current/{name}/slack-analysis.txt"
+    if not skip_slack:
+        prompt += f"""
+STEP 5 — WRITE SLACK ANALYSIS (do NOT post — Jenkins posts it via webhook as the bot)
+This is the most important step. The Slack message must be a FULL ANALYSIS, not a summary.
+
+5a. Search for the Jenkins Bot message:
+    Use mcp__slack__search_messages with query "dashboard-e2e-tests/{build_number}" to find the bot's build notification.
+
+5b. Get historical context:
+    Use mcp__slack__search_messages to find the 5 previous builds' bot messages.
+    Use mcp__slack__get_thread on each to read thread replies.
+
+5c. Enrich with external context:
+    For each Jira ticket referenced in threads, fetch current status via Jira API.
+    For each PR referenced, check if it's merged/open/closed.
+
+5d. Write the Slack analysis to {slack_analysis_path} (the CI pipeline will post it via webhook).
+    Do NOT use mcp__slack__post_message — that posts as the user, not the bot.
+    The message MUST include all of these sections:
+    - Header: "*NOTE: _This is an Agentic-AI generated message_*" then Jira link (use :jira: emoji, NOT :jira2:), stats (total/passed/failed/flaky count), cluster health.
+    - If pipeline failed, use the specific step name from CONTEXT (e.g. "Validate RHOAI Health Failed", "Deploy RHOAI operator Failed"). Do NOT use generic labels like "INFRASTRUCTURE FAILURE".
+    - Flaky tests: only mention the COUNT in the stats line (e.g. "flaky: 3"). Do NOT list individual flaky test names anywhere in the Slack message.
+    - TFA report link: include "{report_artifact_url}" if available.
+    - Deployment info: operator SHA, build date, RHOAI version, dashboard commit.
+    - Failure clusters with root cause analysis — explain WHY, not just what. For each real failure, include the team @-mention from the CONTEXT above (copy the `<!subteam^...|...>` exactly as given).
+    - Related PRs with status (merged/open) and whether the fix is in this build's image.
+    - Related Jira tickets with current status and assignee.
+    - Trend analysis: compare vs previous builds using thread data. Show trajectory.
+    - Recovery notes: tests that were previously failing but now pass.
+    Use Slack mrkdwn formatting (NOT markdown):
+    - Bold: *text* (single asterisks). NEVER use **text** (double asterisks — Slack renders them as literal **).
+    - Italic: _text_ (underscores).
+    - Code: `text` (backticks).
+    - Headings: Slack has NO heading syntax. Do NOT use # or ## or ###. Use *Bold Text* on its own line instead.
+    - Bullet points: use • or - (both work).
+    - Links: <url|text>.
+    - Emojis: :emoji_name:.
+    Keep under 39000 characters (Slack message limit is 40000).
+
+5e. Verify: read {slack_analysis_path} and confirm it exists and has content.
+"""
+    else:
+        prompt += "\nSTEP 5 — SLACK: Skipped (no tokens configured).\n"
+
+    return prompt
 
 
-def run_deep_analysis(build_number: str, product: str) -> int:
-    """Run Claude Code agent for deep analysis, Jira posting, and Slack thread."""
-    prompt = build_deep_analysis_prompt(build_number, product)
+def run_deep_analysis(build_number: str, product: str, skip_slack: bool = False, dsc_status: dict | None = None) -> int:
+    """Run Claude Code agent for the full workflow. Returns 0 on success."""
+    prompt = build_deep_analysis_prompt(build_number, product, skip_slack=skip_slack, dsc_status=dsc_status)
+
+    if DEEP_ANALYSIS_OUTPUT.exists():
+        DEEP_ANALYSIS_OUTPUT.unlink()
 
     cmd = [
         "claude",
@@ -454,6 +702,76 @@ def run_deep_analysis(build_number: str, product: str) -> int:
     auth_mode = "Vertex AI" if use_vertex else "Anthropic API"
     log(f"Running Claude Code agent for deep analysis (auth: {auth_mode})...")
     result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+
+    if result.returncode != 0:
+        log(f"Claude Code agent exited with code {result.returncode}")
+        return result.returncode
+
+    if not DEEP_ANALYSIS_OUTPUT.exists():
+        log(f"Deep analysis: FAILED — agent did not write {DEEP_ANALYSIS_OUTPUT}")
+        return 1
+
+    size = DEEP_ANALYSIS_OUTPUT.stat().st_size
+    if size < 200:
+        log(f"Deep analysis: FAILED — output too small ({size} bytes), likely incomplete")
+        return 1
+
+    log(f"Deep analysis: agent wrote {size} bytes to {DEEP_ANALYSIS_OUTPUT}")
+    return 0
+
+
+def postprocess_slack_analysis(build_number: str, product: str):
+    """Convert any leftover markdown syntax in slack-analysis.txt to Slack mrkdwn."""
+    name = product.upper()
+    path = PROJECT_ROOT / "reports" / "current" / name / "slack-analysis.txt"
+    if not path.exists():
+        return
+    text = path.read_text()
+    original = text
+    # **bold** → *bold* (but not inside code blocks)
+    text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)
+    # ### heading / ## heading / # heading → *heading* on its own line
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+    # :jira2: → :jira:
+    text = text.replace(':jira2:', ':jira:')
+    if text != original:
+        path.write_text(text)
+        log("Slack analysis: converted markdown → Slack mrkdwn")
+
+
+def inject_deep_analysis(build_number: str, product: str, jira_ticket: str) -> int:
+    """Inject deep analysis into reports and optionally upload to Jira."""
+    name = product.upper()
+    html_path = PROJECT_ROOT / "reports" / "current" / name / f"latest-build-{build_number}.html"
+    md_path = PROJECT_ROOT / "reports" / "current" / name / f"latest-build-{build_number}.md"
+
+    if not html_path.exists():
+        log(f"Report injection: HTML report not found at {html_path}")
+        return 1
+
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "inject_deep_analysis.py"),
+        str(html_path),
+        str(DEEP_ANALYSIS_OUTPUT),
+    ]
+
+    if md_path.exists():
+        cmd.extend(["--update-md", str(md_path)])
+
+    if jira_ticket and not is_true("SKIP_JIRA"):
+        cmd.extend(["--jira-ticket", jira_ticket])
+
+    log("Injecting deep analysis into reports...")
+    result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+
+    if result.returncode == 0:
+        log("Report injection: OK")
+        if jira_ticket and not is_true("SKIP_JIRA"):
+            log(f"Jira upload: OK ({jira_ticket})")
+    else:
+        log(f"Report injection: FAILED ({result.returncode})")
+
     return result.returncode
 
 
@@ -473,23 +791,25 @@ def main():
     product = os.getenv("PRODUCT").lower()
     skip_deep = is_true("SKIP_DEEP_ANALYSIS")
 
-    skip_slack = not is_false("SKIP_SLACK")
+    has_slack_tokens = bool(os.getenv("SLACK_XOXC_TOKEN")) and bool(os.getenv("SLACK_XOXD_TOKEN"))
+    skip_slack = not is_false("SKIP_SLACK") and not has_slack_tokens
 
     log(f"Build: {build_number}")
     log(f"Product: {product}")
     log(f"Deep analysis: {'disabled' if skip_deep else 'enabled'}")
-    log(f"Slack: {'disabled (default in CI — set SKIP_SLACK=false to enable)' if skip_slack else 'enabled'}")
+    log(f"Slack: {'disabled' if skip_slack else 'enabled (tokens present)'}")
 
     # Setup
     setup_tracer()
     setup_cluster_access(product, build_number)
+    dsc_status = check_dsc_status()
     setup_frontend_repo()
 
     # Phase 1: Automated analysis
     log("")
     log("Phase 1: Automated analysis")
     log("-" * 40)
-    analysis_rc = run_analysis(build_number, product)
+    analysis_rc = run_analysis(build_number, product, skip_slack=skip_slack)
 
     if analysis_rc != 0:
         log(f"Automated analysis exited with code {analysis_rc}")
@@ -500,25 +820,41 @@ def main():
     if not skip_deep:
         configure_mcp_servers()
 
-    # Phase 2: Claude Code deep analysis
+    # Phase 2: Claude Code agent — full workflow (deep analysis, Jira, Slack)
+    deep_rc = 0
     if not skip_deep:
         log("")
-        log("Phase 2: Deep analysis (Claude Code agent)")
+        log("Phase 2: Agent workflow (Claude Code)")
         log("-" * 40)
-        deep_rc = run_deep_analysis(build_number, product)
-        if deep_rc != 0:
-            log(f"Deep analysis exited with code {deep_rc}")
+        deep_rc = run_deep_analysis(build_number, product, skip_slack=skip_slack, dsc_status=dsc_status)
+
+        postprocess_slack_analysis(build_number, product)
+
+        # Fallback: if agent wrote findings but didn't inject them, do it here
+        if deep_rc == 0 and DEEP_ANALYSIS_OUTPUT.exists():
+            name = product.upper()
+            html_path = PROJECT_ROOT / "reports" / "current" / name / f"latest-build-{build_number}.html"
+            html_has_analysis = False
+            if html_path.exists():
+                html_has_analysis = "Deep Analysis" in html_path.read_text()[:50000]
+            if not html_has_analysis:
+                log("Agent did not inject analysis into reports — running fallback injection")
+                context = extract_phase1_context(build_number, product)
+                jira_ticket = context.get("jira_ticket", "")
+                inject_deep_analysis(build_number, product, jira_ticket)
+        elif deep_rc != 0:
+            log("Agent workflow failed — reports will not contain deep analysis")
     else:
         log("")
         log("Phase 2: Skipped (SKIP_DEEP_ANALYSIS=true)")
-        deep_rc = 0
 
     # Summary
     log("")
     log("=" * 50)
     log(f"Automated analysis: {'OK' if analysis_rc == 0 else f'FAILED ({analysis_rc})'}")
     if not skip_deep:
-        log(f"Deep analysis:      {'OK' if deep_rc == 0 else f'FAILED ({deep_rc})'}")
+        agent_ok = deep_rc == 0
+        log(f"Deep analysis:      {'OK' if agent_ok else 'FAILED — no analysis in report'}")
 
     # Exit with analysis exit code (deep analysis failures are non-fatal)
     sys.exit(analysis_rc)

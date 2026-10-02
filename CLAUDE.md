@@ -90,7 +90,11 @@ Entry point: `scripts/ci_entrypoint.py`. Skip flags: `SKIP_DEEP_ANALYSIS`, `SKIP
 - **Test Variables** — `RHOAI_TEST_VARIABLES`/`ODH_TEST_VARIABLES` (absolute path to `test-variables.yml` per cluster). Falls back to `<frontend_repo>/packages/cypress/test-variables.yml` if not set.
 - **GitLab** — `GITLAB_URL` + `GITLAB_TOKEN` (commit tracking)
 - **Tracer** — `TRACER_PATH` (optional, image metadata extraction)
-- **Slack** — [redhat-community-ai-tools/slack-mcp](https://github.com/redhat-community-ai-tools/slack-mcp) MCP server. Read channel history and send analysis summaries.
+- **Slack** — Two complementary mechanisms, both posting as "RHOAI Jenkins Bot":
+  - **Agent analysis** — [redhat-community-ai-tools/slack-mcp](https://github.com/redhat-community-ai-tools/slack-mcp) MCP server. The Claude Code agent uses xoxc/xoxd browser session tokens (`SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN`) to read channel history and post full analysis summaries. The xoxc token is also used by `findMessageTs()` in the Jenkins shared library to search for the bot's original build notification and retrieve its `thread_ts` for threaded replies.
+  - **TFA summary** — Jenkins Incoming Webhook (`dashboard-slack-webhook` in Vault `apps/rhods-ci/slack`). Posts a compact stats summary (`tfa-summary.txt`) as a threaded reply on the bot's build notification. Because it uses an Incoming Webhook, the message always appears as the bot identity regardless of who triggered the build.
+  - **Token rotation** — xoxc/xoxd tokens are browser session tokens that expire every 2-4 weeks. When they expire, extract new ones from the Slack web app and update `slack-xoxc-token`/`slack-xoxd-token` in Vault at `apps/rhods-ci/agents`. See RHOAIENG-97002 for extraction instructions.
+  - **Future** — A dedicated Slack app (Dashboard's ATFA, App ID: `A0BF3QFPP7W`) is pending workspace admin approval. Once approved, it will replace the xoxc/xoxd tokens with a proper bot token, eliminating the need for manual token rotation.
 - **Kubernetes/OpenShift** — [kubernetes-mcp-server](https://github.com/openshift/openshift-mcp-server) MCP server (full read-write). Provides direct access to pods, logs, events, namespaces, resource metrics, and OpenShift projects without needing `oc login`. Also supports write operations: create/update/delete resources, exec into pods, scale deployments. Uses `~/.kube/config`.
 
 ## Code Conventions
@@ -291,7 +295,7 @@ The message must include:
 
 1. **Header** — disclaimer line, Jira link, overall stats (total/passed/failed/flaky), cluster health, pipeline failure
 2. **Operator and image info** — pass `image_metadata` (from tracer) to `compose_slack_message()` / `build_slack_analysis()` so the `:gear: Deployment Info` section renders automatically. It shows: operator SHA + build date + RHOAI version + build notification link (or "not found"), dashboard commit with GitHub link, FBC fragment. If the operator is stale (built days ago), call it out — fixes merged after the image build won't be present.
-3. **Failure clusters with root cause analysis** — group failures by root cause, explain WHY each cluster fails (not just the error message), link to the specific PR or config change that caused it
+3. **Failure clusters with root cause analysis** — group failures by root cause, explain WHY each cluster fails (not just the error message), link to the specific PR or config change that caused it. **Always include the owning scrum team @-mention** next to each failure by resolving the test file path against `team-ownership.json` in the odh-dashboard repo (`packages/cypress/cypress/tests/e2e/team-ownership.json`). Use the Slack subteam syntax `<!subteam^GROUP_ID>` with the `slack_group_id` from the mapping. Match test file paths against `path_patterns` entries. This is mandatory — never omit team mentions from failure lines.
 4. **Related PRs** — for each failure cluster, link to PRs that caused, fix, or are related to the failures. Include PR status (merged/open), author, and whether the PR is in the deployed image.
 5. **Related Jira tickets** — link to existing bugs with their current status. If a ticket was discussed in previous threads, summarize the latest status (who's assigned, what's the latest comment, is a fix merged).
 6. **Trend analysis** — compare vs previous builds. What improved? What regressed? What's persistent? Use the historical thread data to show the trajectory (e.g., "Model serving: 8 failures in #936 → 3 in #942 → 1 in #969 → 6 in #992 (regression)")
@@ -299,11 +303,11 @@ The message must include:
 8. **Historical context** — reference relevant discussions from previous build threads (who is working on what, what was decided, what's blocking)
 9. **Reclassifications** — if deep analysis revealed some "real" failures are actually flaky (passed on retry), call this out with the corrected count
 
-Use Slack formatting: `*bold*`, `_italic_`, `` `code` ``, `:emoji:`, bullet points. Link to Jira tickets, PRs, and previous thread messages where relevant.
+Use Slack formatting: `*bold*` (single asterisks, NOT `**`), `_italic_`, `` `code` ``, `:emoji:`, bullet points. No `###` headings (Slack has none — use `*bold line*` instead). Use `:jira:` emoji, NEVER `:jira2:` (it doesn't exist in this workspace). Link to Jira tickets, PRs, and previous thread messages where relevant.
 
 Always start the message with:
 ```
-*NOTE: _This is an Agentic-AI generated message. This feature is still WIP_*
+*NOTE: _This is an Agentic-AI generated message_*
 ```
 
 Use the `post_analysis_summaries.py slack` script only as a starting point for the header/stats section if helpful, but the analysis body must be written by the agent with full context.
