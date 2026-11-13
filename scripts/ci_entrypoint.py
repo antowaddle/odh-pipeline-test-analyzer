@@ -817,9 +817,21 @@ def run_deep_analysis(build_number: str, product: str, skip_slack: bool = False,
 
     # Log Slack context gathering results
     name = product.upper()
-    context_log = PROJECT_ROOT / "reports" / "current" / name / "slack-context-log.txt"
-    slack_analysis = PROJECT_ROOT / "reports" / "current" / name / "slack-analysis.txt"
+    report_dir = PROJECT_ROOT / "reports" / "current" / name
+    context_log = report_dir / "slack-context-log.txt"
+    slack_analysis = report_dir / "slack-analysis.txt"
     if not skip_slack:
+        # LLM agents occasionally normalize the artifact filenames to underscores
+        # (slack_analysis.txt / slack_context_log.txt). The pipeline — verification below,
+        # postprocess_slack_analysis() and the Jenkins cp step — only knows the hyphenated
+        # names, so a silently renamed file means no Slack post (RHOAIENG-103754).
+        # Normalize underscore variants to the canonical hyphenated names before checking.
+        for stem in ("slack_analysis", "slack_context_log"):
+            src = report_dir / f"{stem}.txt"
+            dst = report_dir / f"{stem.replace('_', '-')}.txt"
+            if src.exists() and not dst.exists():
+                src.rename(dst)
+                log(f"Slack artifact normalization: renamed {src.name} -> {dst.name}")
         if context_log.exists():
             content = context_log.read_text()
             tagged = [l for l in content.splitlines() if l.startswith("[")]
